@@ -106,6 +106,11 @@ jobs:
 
   # ================================================================
   # 3. SCA - OWASP DEPENDENCY-CHECK
+  #
+  # El Nightly es informativo:
+  # - intenta generar reportes SCA;
+  # - si NVD/servicio externo falla, no tumba todo el Nightly;
+  # - el Quality Gate lee el JSON cuando existe.
   # ================================================================
   sca-dependency-check:
     name: SCA - OWASP Dependency-Check
@@ -122,8 +127,6 @@ jobs:
           distribution: temurin
           cache: maven
 
-      # Cache de la base de vulnerabilidades.
-      # Evita descargar toda la información en cada ejecución nightly.
       - name: Cache Dependency-Check database
         uses: actions/cache@v4
         with:
@@ -133,19 +136,19 @@ jobs:
             dependency-check-data-${{ runner.os }}-
 
       - name: Run OWASP Dependency-Check
+        id: dependency_check
+        continue-on-error: true
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         shell: bash
         run: |
           EXTRA_ARGS=()
 
-          # Solo enviar la API Key si realmente existe.
-          # Así evitamos el error "Invalid API Key, length of 0".
           if [ -n "$NVD_API_KEY" ]; then
             echo "NVD API Key configured."
             EXTRA_ARGS+=("-DnvdApiKey=$NVD_API_KEY")
           else
-            echo "NVD API Key not configured. Running without API key."
+            echo "::warning::NVD API Key not configured. Running without API key."
           fi
 
           mvn -B org.owasp:dependency-check-maven:13.0.0:check \
@@ -155,8 +158,18 @@ jobs:
               -DossIndexAnalyzerEnabled=false \
               "${EXTRA_ARGS[@]}"
 
+      - name: Report Dependency-Check execution status
+        if: always()
+        shell: bash
+        run: |
+          echo "Dependency-Check step outcome: ${{ steps.dependency_check.outcome }}"
+          if [[ "${{ steps.dependency_check.outcome }}" != "success" ]]; then
+            echo "::warning::Dependency-Check did not complete successfully. The Nightly will continue."
+          fi
+
       - name: Verify Dependency-Check reports
         if: always()
+        shell: bash
         run: |
           echo "Dependency-Check reports:"
           find target -maxdepth 2 -type f \
@@ -219,9 +232,13 @@ jobs:
 
 
   # ================================================================
-  # 5. QUALITY GATE
-  # Lee el JSON generado por Dependency-Check.
-  # Bloquea HIGH / CRITICAL o CVSS >= 7.
+  # 5. QUALITY GATE - SECURITY REPORTS
+  #
+  # Nightly:
+  # - falla si Build, CodeQL o SpotBugs fallan;
+  # - intenta leer Dependency-Check;
+  # - HIGH/CRITICAL se reportan como advertencias;
+  # - el bloqueo de merges se aplica en el pipeline de main.
   # ================================================================
   quality-gate:
     name: Quality Gate - Security Reports
@@ -236,10 +253,6 @@ jobs:
     if: always()
 
     steps:
-
-      # --------------------------------------------------------------
-      # Verificar que las herramientas realmente se ejecutaron
-      # --------------------------------------------------------------
       - name: Check previous job results
         shell: bash
         run: |
@@ -264,35 +277,29 @@ jobs:
             FAILED=1
           fi
 
-          if [[ "${{ needs.sca-dependency-check.result }}" != "success" ]]; then
-            echo "::error::OWASP Dependency-Check execution failed."
-            FAILED=1
-          fi
-
           if [[ "${{ needs.static-analysis.result }}" != "success" ]]; then
             echo "::error::SpotBugs execution failed."
             FAILED=1
           fi
 
+          if [[ "${{ needs.sca-dependency-check.result }}" != "success" ]]; then
+            echo "::warning::Dependency-Check job did not complete successfully."
+          fi
+
           if [[ "$FAILED" -eq 1 ]]; then
-            echo "QUALITY GATE FAILED - security tool execution error."
+            echo "QUALITY GATE FAILED - required CI/security tool execution error."
             exit 1
           fi
 
+          echo "Required jobs completed successfully."
 
-      # --------------------------------------------------------------
-      # Descargar el reporte producido por Dependency-Check
-      # --------------------------------------------------------------
       - name: Download Dependency-Check report
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: dependency-check-report
           path: dependency-check-report
 
-
-      # --------------------------------------------------------------
-      # Leer realmente el JSON y detectar vulnerabilidades
-      # --------------------------------------------------------------
       - name: Analyze Dependency-Check report
         env:
           QUALITY_GATE_CVSS: ${{ env.QUALITY_GATE_CVSS }}
@@ -306,14 +313,21 @@ jobs:
           report = "dependency-check-report/dependency-check-report.json"
           threshold = float(os.environ.get("QUALITY_GATE_CVSS", "7.0"))
 
+          print("")
+          print("==============================================")
+          print("       DEPENDENCY-CHECK QUALITY GATE")
+          print("==============================================")
+
           if not os.path.exists(report):
-              print("::error::Dependency-Check JSON report was not found.")
-              sys.exit(1)
+              print("::warning::Dependency-Check JSON report was not generated.")
+              print("Nightly continues because the report is unavailable.")
+              print("QUALITY GATE COMPLETED WITH WARNING")
+              sys.exit(0)
 
           with open(report, "r", encoding="utf-8") as f:
               data = json.load(f)
 
-          blocked = []
+          findings = []
 
           for dependency in data.get("dependencies", []):
               filename = dependency.get("fileName", "unknown")
@@ -328,7 +342,6 @@ jobs:
 
                   for key in ("cvssv4", "cvssv3", "cvssv2"):
                       cvss = vulnerability.get(key) or {}
-
                       try:
                           if "baseScore" in cvss:
                               scores.append(float(cvss["baseScore"]))
@@ -337,44 +350,35 @@ jobs:
 
                   score = max(scores) if scores else 0.0
 
-                  if (
-                      severity in ("HIGH", "CRITICAL")
-                      or score >= threshold
-                  ):
-                      blocked.append(
-                          (name, severity, score, filename)
-                      )
+                  if severity in ("HIGH", "CRITICAL") or score >= threshold:
+                      findings.append((name, severity, score, filename))
 
-          print("")
-          print("==============================================")
-          print("       DEPENDENCY-CHECK QUALITY GATE")
-          print("==============================================")
+          critical = [x for x in findings if x[1] == "CRITICAL"]
+          high = [x for x in findings if x[1] == "HIGH"]
+
           print(f"CVSS threshold: {threshold}")
-          print(f"HIGH/CRITICAL findings: {len(blocked)}")
+          print(f"CRITICAL findings: {len(critical)}")
+          print(f"HIGH findings: {len(high)}")
+          print(f"TOTAL findings >= threshold: {len(findings)}")
           print("==============================================")
 
-          if blocked:
-              for name, severity, score, filename in blocked[:30]:
+          if findings:
+              for name, severity, score, filename in findings[:30]:
                   print(
-                      f"::error::{name} | "
+                      f"::warning::{name} | "
                       f"Severity={severity} | "
                       f"CVSS={score} | "
                       f"Dependency={filename}"
                   )
 
-              if len(blocked) > 30:
-                  print(
-                      f"... and {len(blocked) - 30} additional findings."
-                  )
+              if len(findings) > 30:
+                  print(f"... and {len(findings) - 30} additional findings.")
 
               print("")
-              print("QUALITY GATE FAILED")
-              print(
-                  "HIGH/CRITICAL vulnerabilities were detected "
-                  "by OWASP Dependency-Check."
-              )
-
-              sys.exit(1)
+              print("QUALITY GATE: SECURITY FINDINGS DETECTED")
+              print("HIGH/CRITICAL findings were read from the Dependency-Check report.")
+              print("Nightly remains informational; blocking enforcement is applied on main.")
+              sys.exit(0)
 
           print("")
           print("QUALITY GATE PASSED")
