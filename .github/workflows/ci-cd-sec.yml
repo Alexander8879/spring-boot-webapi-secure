@@ -2,34 +2,46 @@ name: CI/CD - Spring Boot DevSecOps
 
 on:
   push:
-    branches: [ main, develop, feature/**, bugfix/**, hotfix/** ]
+    branches:
+      - main
+      - develop
+
   pull_request:
-    branches: [ main, develop ]
-  # Optional: also trigger on version tags
-  # tags: [ 'v*.*.*' ]
+    branches:
+      - main
+      - develop
+
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
-  JAVA_VERSION: '25'
+  JAVA_VERSION: '21'
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}   # e.g. your-org/your-app
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # ==================================================================
-  # CI JOBS (same as before – kept for completeness)
-  # ==================================================================
+
+  # ================================================================
+  # 1. BUILD + TEST
+  # ================================================================
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-java@v4
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: temurin
@@ -38,203 +50,369 @@ jobs:
       - name: Build & test with coverage
         run: mvn -B clean verify
 
-      - name: Upload reports
-        uses: actions/upload-artifact@v4
+      - name: Upload test reports
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: test-reports
           path: |
             target/surefire-reports/
             target/site/jacoco/
+          if-no-files-found: warn
           retention-days: 7
 
+
+  # ================================================================
+  # 2. SAST - CODEQL
+  # ================================================================
   sast-codeql:
     name: SAST - CodeQL
     runs-on: ubuntu-latest
+
     permissions:
       security-events: write
       contents: read
       actions: read
+
     steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - uses: github/codeql-action/init@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
         with:
           languages: java
           queries: security-and-quality
-      - uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
-      - uses: github/codeql-action/autobuild@v3
-      - uses: github/codeql-action/analyze@v3
 
-  sca-dependency-check:
-    name: SCA - OWASP Dependency-Check
-    runs-on: ubuntu-latest
-    if: false
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: temurin
           cache: maven
-      - name: Run Dependency-Check
-        run: mvn -B org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=7 || true
-      - uses: actions/upload-artifact@v4
-        if: always()
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
         with:
-          name: dependency-check-report
-          path: target/dependency-check-report.html
+          category: "/language:java"
+
+
+  # ================================================================
+  # 3. STATIC ANALYSIS - SPOTBUGS
+  # ================================================================
+  static-analysis:
+    name: Static Analysis - SpotBugs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Compile project
+        run: mvn -B clean compile
+
+      - name: Run SpotBugs
+        run: |
+          mvn -B \
+            com.github.spotbugs:spotbugs-maven-plugin:4.10.4.1:spotbugs \
+            -Dspotbugs.xmlOutput=true \
+            -Dspotbugs.htmlOutput=true
+
+      - name: Upload SpotBugs report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spotbugs-report
+          path: |
+            target/spotbugs*.xml
+            target/reports/spotbugs.html
+          if-no-files-found: warn
           retention-days: 14
 
-  # ==================================================================
-  # CD JOBS – only on main (or tags)
-  # ==================================================================
-  docker-build-scan-push:
-    name: Docker Build → Scan → Push
-    runs-on: ubuntu-latest
-    needs: [build-and-test, sast-codeql]   # wait for CI quality gates
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: read
-      packages: write          # needed to push to GHCR
-      security-events: write   # for Trivy SARIF upload
-      id-token: write          # for optional image signing later
 
-    outputs:
-      image-digest: ${{ steps.push.outputs.digest }}
-      image-tags: ${{ steps.meta.outputs.tags }}
+  # ================================================================
+  # 4. QUALITY GATE DEL CI
+  # ================================================================
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+
+    needs:
+      - build-and-test
+      - sast-codeql
+      - static-analysis
+
+    if: always()
 
     steps:
-      - name: Checkout
+      - name: Validate CI results
+        shell: bash
+        run: |
+          echo "============================================"
+          echo "          DEVSECOPS QUALITY GATE"
+          echo "============================================"
+
+          echo "Build & Test : ${{ needs.build-and-test.result }}"
+          echo "CodeQL       : ${{ needs.sast-codeql.result }}"
+          echo "SpotBugs     : ${{ needs.static-analysis.result }}"
+
+          FAILED=0
+
+          if [[ "${{ needs.build-and-test.result }}" != "success" ]]; then
+            echo "::error::Build or tests failed"
+            FAILED=1
+          fi
+
+          if [[ "${{ needs.sast-codeql.result }}" != "success" ]]; then
+            echo "::error::CodeQL analysis failed"
+            FAILED=1
+          fi
+
+          if [[ "${{ needs.static-analysis.result }}" != "success" ]]; then
+            echo "::error::SpotBugs analysis failed"
+            FAILED=1
+          fi
+
+          if [[ "$FAILED" -eq 1 ]]; then
+            echo "============================================"
+            echo "QUALITY GATE FAILED"
+            echo "============================================"
+            exit 1
+          fi
+
+          echo "============================================"
+          echo "QUALITY GATE PASSED"
+          echo "============================================"
+
+
+  # ================================================================
+  # 5. DOCKER + TRIVY SECURITY GATE
+  #
+  # NO corre en develop.
+  #
+  # Corre:
+  # - Pull Request hacia main
+  # - Push real a main
+  #
+  # Esto permite bloquear merges peligrosos hacia main.
+  # ================================================================
+  docker-security:
+    name: Docker Build → Trivy Security Gate
+    runs-on: ubuntu-latest
+
+    needs:
+      - quality-gate
+
+    if: |
+      (github.event_name == 'pull_request' && github.base_ref == 'main') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    permissions:
+      contents: read
+      security-events: write
+      packages: write
+
+    steps:
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+
+      # ------------------------------------------------------------
+      # Construir imagen solamente para analizarla
+      # ------------------------------------------------------------
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: devsecops-local:${{ github.sha }}
+
+
+      # ------------------------------------------------------------
+      # TRIVY - generar reporte JSON
+      #
+      # IMPORTANTE:
+      # Trivy NO tumba directamente el workflow.
+      # Primero genera el reporte.
+      # Después nuestro Quality Gate LO LEE.
+      # ------------------------------------------------------------
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: devsecops-local:${{ github.sha }}
+          format: json
+          output: trivy-results.json
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+          scanners: vuln
+
+
+      # ------------------------------------------------------------
+      # Guardar reporte
+      # ------------------------------------------------------------
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-security-report
+          path: trivy-results.json
+          if-no-files-found: error
+          retention-days: 14
+
+
+      # ------------------------------------------------------------
+      # QUALITY GATE DE SEGURIDAD
+      #
+      # Lee realmente el JSON generado por Trivy.
+      # Si encuentra HIGH/CRITICAL:
+      #    exit 1
+      #
+      # De esta forma los merges hacia main pueden bloquearse.
+      # ------------------------------------------------------------
+      - name: Quality Gate - Read Trivy report
+        shell: bash
+        run: |
+          python <<'PY'
+          import json
+          import sys
+          import os
+
+          report = "trivy-results.json"
+
+          if not os.path.exists(report):
+              print("::error::Trivy report was not generated.")
+              sys.exit(1)
+
+          with open(report, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          findings = []
+
+          for result in data.get("Results", []):
+              for vulnerability in result.get("Vulnerabilities") or []:
+
+                  severity = str(
+                      vulnerability.get("Severity", "")
+                  ).upper()
+
+                  if severity in ("HIGH", "CRITICAL"):
+                      findings.append({
+                          "id": vulnerability.get(
+                              "VulnerabilityID",
+                              "UNKNOWN"
+                          ),
+                          "package": vulnerability.get(
+                              "PkgName",
+                              "unknown"
+                          ),
+                          "severity": severity
+                      })
+
+          critical = [
+              x for x in findings
+              if x["severity"] == "CRITICAL"
+          ]
+
+          high = [
+              x for x in findings
+              if x["severity"] == "HIGH"
+          ]
+
+          print("")
+          print("============================================")
+          print("       TRIVY SECURITY QUALITY GATE")
+          print("============================================")
+          print(f"CRITICAL findings : {len(critical)}")
+          print(f"HIGH findings     : {len(high)}")
+          print(f"TOTAL blocking    : {len(findings)}")
+          print("============================================")
+
+          if findings:
+
+              print("")
+              print("Blocking vulnerabilities:")
+              print("")
+
+              for item in findings[:30]:
+                  print(
+                      f"{item['id']} | "
+                      f"{item['severity']} | "
+                      f"{item['package']}"
+                  )
+
+              if len(findings) > 30:
+                  print(
+                      f"... and {len(findings) - 30} "
+                      "additional findings"
+                  )
+
+              print("")
+              print("QUALITY GATE FAILED")
+              print(
+                  "HIGH or CRITICAL vulnerabilities "
+                  "were detected."
+              )
+
+              sys.exit(1)
+
+          print("")
+          print("QUALITY GATE PASSED")
+          print(
+              "No HIGH or CRITICAL vulnerabilities "
+              "were detected."
+          )
+          PY
+
+
+      # ------------------------------------------------------------
+      # Login GHCR
+      # SOLO después de pasar Trivy y SOLO en push a main
+      # ------------------------------------------------------------
       - name: Log in to GitHub Container Registry
+        if: |
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,prefix=sha-
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build Docker image
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: false                    # build first, scan, then push
-          load: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@0.36.0
-        with:
-          image-ref: ${{ steps.meta.outputs.tags }}
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
-          exit-code: '1'                 # fail the job on CRITICAL/HIGH
-
-      - name: Upload Trivy scan results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: 'trivy-results.sarif'
-
-      - name: Push image to GHCR
-        id: push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # ------------------------------------------------------------------
-  # Optional: Deploy to Staging (example with a simple SSH or K8s)
-  # ------------------------------------------------------------------
-  deploy-staging:
-    name: Deploy to Staging
-    runs-on: ubuntu-latest
-    needs: docker-build-scan-push
-    if: false #github.ref == 'refs/heads/main'
-    environment:
-      name: staging
-      url: https://staging.yourapp.com   # optional status check URL
-
-    steps:
-      - name: Checkout (for manifests)
-        uses: actions/checkout@v4
-
-      # Example 1: Simple SSH + docker compose (good for small teams)
-      # - name: Deploy via SSH
-      #   uses: appleboy/ssh-action@v1.0.3
-      #   with:
-      #     host: ${{ secrets.STAGING_HOST }}
-      #     username: ${{ secrets.STAGING_USER }}
-      #     key: ${{ secrets.STAGING_SSH_KEY }}
-      #     script: |
-      #       docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-      #       docker compose -f /opt/app/docker-compose.yml up -d
-
-      # Example 2: Kubernetes with kubectl (more production-like)
-      - name: Set up kubectl
-        uses: azure/setup-kubectl@v4
-
-      - name: Configure kubeconfig
+      # ------------------------------------------------------------
+      # Publicar imagen únicamente en MAIN
+      # ------------------------------------------------------------
+      - name: Push Docker image to GHCR
+        if: |
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main'
+        shell: bash
         run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > $HOME/.kube/config
+          TARGET="${REGISTRY}/${IMAGE_NAME}"
 
-      - name: Deploy to staging
-        run: |
-          # Update image tag in deployment (simple sed example)
-          sed -i "s|image:.*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.docker-build-scan-push.outputs.image-digest }}|" k8s/staging/deployment.yaml
-          kubectl apply -f k8s/staging/
-          kubectl rollout status deployment/your-app -n staging --timeout=120s
+          docker tag \
+            devsecops-local:${GITHUB_SHA} \
+            "${TARGET}:${GITHUB_SHA}"
 
-  # ------------------------------------------------------------------
-  # Optional: Production promotion (manual approval)
-  # ------------------------------------------------------------------
-  deploy-production:
-    name: Deploy to Production
-    runs-on: ubuntu-latest
-    needs: deploy-staging
-    if: false #github.ref == 'refs/heads/main'
-    environment:
-      name: production          # requires manual approval in GitHub UI
-      url: https://yourapp.com
+          docker tag \
+            devsecops-local:${GITHUB_SHA} \
+            "${TARGET}:latest"
 
-    steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-kubectl@v4
-      - name: Configure kubeconfig (prod)
-        run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > $HOME/.kube/config
-      - name: Deploy to production
-        run: |
-          sed -i "s|image:.*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.docker-build-scan-push.outputs.image-digest }}|" k8s/production/deployment.yaml
-          kubectl apply -f k8s/production/
-          kubectl rollout status deployment/your-app -n production --timeout=180s
+          docker push "${TARGET}:${GITHUB_SHA}"
+          docker push "${TARGET}:latest"
