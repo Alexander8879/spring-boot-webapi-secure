@@ -2,8 +2,8 @@ name: CI/CD Nightly + SCA
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # 02:00 UTC
-  workflow_dispatch:      # Permite dispararlo manualmente desde GitHub
+    - cron: '0 2 * * *'
+  workflow_dispatch:
 
 jobs:
   nightly-security-audit:
@@ -28,7 +28,7 @@ jobs:
 
       - name: Escaneo SCA (OWASP Dependency-Check)
         run: |
-          ./mvnw org.owasp:dependency-check-maven:11.1.1:check \
+          mvn org.owasp:dependency-check-maven:11.1.1:check \
             -Dformat=ALL \
             -DfailOnError=false \
             -DossindexAnalyzerEnabled=true

@@ -25,11 +25,11 @@ jobs:
           cache: 'maven'
 
       - name: Compilar y Ejecutar Pruebas Unitarias
-        run: ./mvnw clean test
+        run: mvn clean test
 
       - name: Ejecutar SpotBugs (SAST Bytecode)
         run: |
-          ./mvnw com.github.spotbugs:spotbugs-maven-plugin:4.8.6.6:spotbugs \
+          mvn com.github.spotbugs:spotbugs-maven-plugin:4.8.6.6:spotbugs \
             -Dspotbugs.effort=Max \
             -Dspotbugs.threshold=Low \
             -Dspotbugs.xmlOutput=true \

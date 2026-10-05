@@ -23,12 +23,13 @@ jobs:
           cache: 'maven'
 
       - name: Compilar y Test de Integración
-        run: ./mvnw clean verify -DskipTests=false
+        run: mvn clean verify -DskipTests=false
 
       - name: SpotBugs SAST
         run: |
-          ./mvnw com.github.spotbugs:spotbugs-maven-plugin:4.8.6.6:spotbugs \
+          mvn com.github.spotbugs:spotbugs-maven-plugin:4.8.6.6:spotbugs \
             -Dspotbugs.effort=Max \
+            -Dspotbugs.threshold=Low \
             -Dspotbugs.xmlOutput=true \
             -Dspotbugs.failOnError=false
 
@@ -42,7 +43,7 @@ jobs:
           python3 .github/scripts/quality_gate.py semgrep-report.json /dev/null
 
       - name: Empaquetar Artefacto JAR
-        run: ./mvnw package -DskipTests
+        run: mvn package -DskipTests
 
       - name: Despliegue Simulado por Entorno
         run: |
