@@ -1,36 +1,31 @@
-# ---- Build stage ----
+# Etapa 1: Build
 FROM eclipse-temurin:21-jdk-alpine AS builder
+
+# Instalar Maven en Alpine
+RUN apk add --no-cache maven
+
 WORKDIR /app
 
-# Copy Maven wrapper & pom first (better layer caching)
-COPY mvnw .
-COPY .mvn .mvn
+# Copiar configuración de dependencias
 COPY pom.xml .
+RUN mvn dependency:go-offline -B
 
-# Download dependencies (cached unless pom changes)
-RUN ./mvnw dependency:go-offline -B
+# Copiar código fuente y compilar
+COPY src ./src
+RUN mvn clean package -DskipTests
 
-# Copy source and build
-COPY src src
-RUN ./mvnw package -DskipTests -B
+# Etapa 2: Runtime
+FROM eclipse-temurin:21-jre-alpine
 
-# ---- Runtime stage ----
-FROM eclipse-temurin:21-jdk-alpine
+WORKDIR /app
 
-# Security: run as non-root user
-RUN groupadd -r spring && useradd -r -g spring spring
+# Crear usuario sin privilegios
+RUN addgroup -S spring && adduser -S spring -G spring
 USER spring:spring
 
-WORKDIR /app
-
-# Copy only the fat jar
+# Copiar el artefacto generado
 COPY --from=builder /app/target/*.jar app.jar
 
-# Optional: expose actuator / app port
 EXPOSE 8080
 
-# Health check (adjust path if needed)
-HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
-  CMD curl -f http://localhost:8080/actuator/health || exit 1
-
-ENTRYPOINT ["java", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar"]
+ENTRYPOINT ["java", "-jar", "app.jar"]
