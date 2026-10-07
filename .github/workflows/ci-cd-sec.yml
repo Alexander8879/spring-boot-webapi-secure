@@ -125,7 +125,7 @@ jobs:
         with:
           category: "/language:java"
 
-  # 4. SCA - OWASP DEPENDENCY-CHECK
+   # 4. SCA - OWASP DEPENDENCY-CHECK
   sca-dependency-check:
     name: SCA - OWASP Dependency-Check
     runs-on: ubuntu-latest
@@ -135,48 +135,40 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: temurin
           cache: maven
 
-      - name: Run OWASP Dependency-Check
-        id: dependency_check
-        continue-on-error: true
+      - name: Check NVD API configuration
+        id: nvd
+        shell: bash
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-        shell: bash
         run: |
-          EXTRA_ARGS=()
-
-          if [ -n "$NVD_API_KEY" ]; then
-            echo "NVD API Key configured."
-            EXTRA_ARGS+=("-DnvdApiKey=$NVD_API_KEY")
+          if [[ -n "$NVD_API_KEY" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "NVD API Key configurada. Se ejecutará Dependency-Check."
           else
-            echo "::warning::NVD API Key not configured."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "NVD API Key no configurada. SCA se omite por ser un control opcional."
           fi
 
+      - name: Run OWASP Dependency-Check
+        if: steps.nvd.outputs.enabled == 'true'
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
           mvn -B \
             org.owasp:dependency-check-maven:13.0.0:check \
             -Dformat=JSON \
             -DfailBuildOnCVSS=11 \
-            -DossIndexAnalyzerEnabled=false \
-            "${EXTRA_ARGS[@]}"
-
-      - name: Report Dependency-Check status
-        if: always()
-        shell: bash
-        run: |
-          echo "Dependency-Check outcome: ${{ steps.dependency_check.outcome }}"
-
-          if [[ "${{ steps.dependency_check.outcome }}" != "success" ]]; then
-            echo "::warning::Dependency-Check no pudo completar el análisis."
-            echo "::warning::SCA es un control opcional y el pipeline continuará."
-          fi
+            -DnvdApiKey="$NVD_API_KEY" \
+            -DossIndexAnalyzerEnabled=false
 
       - name: Upload Dependency-Check JSON report
-        if: always()
+        if: steps.nvd.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: dependency-check-report

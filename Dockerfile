@@ -3,38 +3,40 @@ FROM maven:3.9.11-eclipse-temurin-21 AS builder
 
 WORKDIR /app
 
-# Copy pom first (better layer caching)
+# Copiar archivos necesarios para compilar
 COPY pom.xml .
+COPY src ./src
 
-# Download dependencies (cached unless pom changes)
-RUN mvn dependency:go-offline -B
+# Compilar la aplicación
+RUN mvn -B --no-transfer-progress clean package -DskipTests
 
-# Copy source and build
-COPY src src
-RUN mvn package -DskipTests -B
+# Seleccionar únicamente el JAR ejecutable
+RUN JAR_FILE=$(find target -maxdepth 1 -type f \
+    -name "*.jar" ! -name "original-*" | head -n 1) \
+    && test -n "$JAR_FILE" \
+    && cp "$JAR_FILE" target/app.jar
 
 
 # ---- Runtime stage ----
 FROM eclipse-temurin:21-jre-alpine
 
-# Install curl for healthcheck and create non-root user
+# Curl para healthcheck y usuario sin privilegios
 RUN apk add --no-cache curl \
     && addgroup -S spring \
     && adduser -S spring -G spring
 
 WORKDIR /app
 
-# Copy only the fat jar
-COPY --from=builder /app/target/*.jar app.jar
+# Copiar únicamente el JAR construido
+COPY --from=builder /app/target/app.jar app.jar
 
-# Security: run as non-root user
+# Ejecutar como usuario no root
 USER spring:spring
 
-# Expose application port
 EXPOSE 8080
 
-# Health check
+# Verificar estado de la aplicación
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
-  CMD curl -f http://localhost:8080/actuator/health || exit 1
+    CMD curl -f http://localhost:8080/actuator/health || exit 1
 
 ENTRYPOINT ["java", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar"]
