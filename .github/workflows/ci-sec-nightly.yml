@@ -1,68 +1,57 @@
-name: CI/CD Nightly + SCA
+name: CI - Nightly - Spring Boot DevSecOps
 
 on:
   schedule:
-    - cron: '0 2 * * *'
-  workflow_dispatch: # Permite ejecutarlo manualmente desde GitHub
+    - cron: '55 20 * * *'
+      timezone: 'America/La_Paz'
+
+  # Permite probar el Nightly manualmente
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+env:
+  JAVA_VERSION: '21'
+  MAVEN_OPTS: '-Xmx2g'
+  QUALITY_GATE_CVSS: '7.0'
 
 jobs:
-  nightly-security-audit:
-    name: Nightly Security Audit
+
+  # ================================================================
+  # 1. BUILD + TEST + COVERAGE
+  # ================================================================
+  build-and-test:
+    name: Build & Test
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout del código
+      - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Configurar Java 21 (Temurin)
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '21'
-          cache: 'maven'
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
 
-      - name: Build & Test (con JaCoCo Cobertura)
-        run: mvn clean test -DskipTests=false
-
-      - name: Static Analysis - SpotBugs
+      - name: Build & run tests with coverage
         run: |
-          mvn com.github.spotbugs:spotbugs-maven-plugin:4.8.6.6:spotbugs \
-            -Dspotbugs.effort=Max \
-            -Dspotbugs.threshold=Low \
-            -Dspotbugs.xmlOutput=true \
-            -Dspotbugs.htmlOutput=true \
-            -Dspotbugs.failOnError=false
+          mvn -B clean verify \
+              -DskipITs=false \
+              org.jacoco:jacoco-maven-plugin:prepare-agent \
+              org.jacoco:jacoco-maven-plugin:report
 
-      - name: SCA - OWASP Dependency-Check
-        run: |
-          mvn org.owasp:dependency-check-maven:11.1.1:check \
-            -Dformat=ALL \
-            -DfailOnError=false \
-            -DossindexAnalyzerEnabled=true
-
-      # --- ARTEFACTO 1: OWASP Dependency-Check ---
-      - name: Subir artefacto Dependency Check
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dependency-check-report
-          path: |
-            target/dependency-check-report.html
-            target/dependency-check-report.json
-
-      # --- ARTEFACTO 2: SpotBugs ---
-      - name: Subir artefacto SpotBugs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: nightly-spotbugs-report
-          path: |
-            target/spotbugsXml.xml
-            target/reports/spotbugs.html
-            target/spotbugs.html
-
-      # --- ARTEFACTO 3: Tests & Cobertura ---
-      - name: Subir artefacto Test & Cobertura
+      - name: Upload test & coverage reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -70,3 +59,328 @@ jobs:
           path: |
             target/surefire-reports/
             target/site/jacoco/
+            target/failsafe-reports/
+          if-no-files-found: warn
+          retention-days: 7
+
+
+  # ================================================================
+  # 2. SAST - CODEQL
+  # ================================================================
+  sast-codeql:
+    name: SAST - CodeQL
+    runs-on: ubuntu-latest
+
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: java
+          queries: security-and-quality
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:java"
+
+
+  # ================================================================
+  # 3. SCA - OWASP DEPENDENCY-CHECK
+  #
+  # El Nightly es informativo:
+  # - intenta generar reportes SCA;
+  # - si NVD/servicio externo falla, no tumba todo el Nightly;
+  # - el Quality Gate lee el JSON cuando existe.
+  # ================================================================
+  sca-dependency-check:
+    name: SCA - OWASP Dependency-Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Cache Dependency-Check database
+        uses: actions/cache@v4
+        with:
+          path: .dependency-check-data
+          key: dependency-check-data-${{ runner.os }}-v13
+          restore-keys: |
+            dependency-check-data-${{ runner.os }}-
+
+      - name: Run OWASP Dependency-Check
+        id: dependency_check
+        continue-on-error: true
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        shell: bash
+        run: |
+          EXTRA_ARGS=()
+
+          if [ -n "$NVD_API_KEY" ]; then
+            echo "NVD API Key configured."
+            EXTRA_ARGS+=("-DnvdApiKey=$NVD_API_KEY")
+          else
+            echo "::warning::NVD API Key not configured. Running without API key."
+          fi
+
+          mvn -B org.owasp:dependency-check-maven:13.0.0:check \
+              -Dformat=ALL \
+              -DfailBuildOnCVSS=11 \
+              -DdataDirectory="$GITHUB_WORKSPACE/.dependency-check-data" \
+              -DossIndexAnalyzerEnabled=false \
+              "${EXTRA_ARGS[@]}"
+
+      - name: Report Dependency-Check execution status
+        if: always()
+        shell: bash
+        run: |
+          echo "Dependency-Check step outcome: ${{ steps.dependency_check.outcome }}"
+          if [[ "${{ steps.dependency_check.outcome }}" != "success" ]]; then
+            echo "::warning::Dependency-Check did not complete successfully. The Nightly will continue."
+          fi
+
+      - name: Verify Dependency-Check reports
+        if: always()
+        shell: bash
+        run: |
+          echo "Dependency-Check reports:"
+          find target -maxdepth 2 -type f \
+            -name "dependency-check-report.*" \
+            -print || true
+
+      - name: Upload Dependency-Check reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: |
+            target/dependency-check-report.html
+            target/dependency-check-report.json
+            target/dependency-check-report.xml
+            target/dependency-check-report.csv
+            target/dependency-check-report.sarif
+          if-no-files-found: warn
+          retention-days: 14
+
+
+  # ================================================================
+  # 4. STATIC ANALYSIS - SPOTBUGS
+  # ================================================================
+  static-analysis:
+    name: Static Analysis - SpotBugs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Compile project
+        run: mvn -B clean compile
+
+      - name: Run SpotBugs
+        run: |
+          mvn -B \
+              com.github.spotbugs:spotbugs-maven-plugin:4.10.4.1:spotbugs \
+              -Dspotbugs.xmlOutput=true \
+              -Dspotbugs.htmlOutput=true
+
+      - name: Upload SpotBugs report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-spotbugs-report
+          path: |
+            target/spotbugs*.xml
+            target/reports/spotbugs.html
+          if-no-files-found: warn
+          retention-days: 14
+
+
+  # ================================================================
+  # 5. QUALITY GATE - SECURITY REPORTS
+  #
+  # Nightly:
+  # - falla si Build, CodeQL o SpotBugs fallan;
+  # - intenta leer Dependency-Check;
+  # - HIGH/CRITICAL se reportan como advertencias;
+  # - el bloqueo de merges se aplica en el pipeline de main.
+  # ================================================================
+  quality-gate:
+    name: Quality Gate - Security Reports
+    runs-on: ubuntu-latest
+
+    needs:
+      - build-and-test
+      - sast-codeql
+      - sca-dependency-check
+      - static-analysis
+
+    if: always()
+
+    steps:
+      - name: Check previous job results
+        shell: bash
+        run: |
+          echo "================================================"
+          echo "          DEVSECOPS NIGHTLY QUALITY GATE"
+          echo "================================================"
+          echo "Build & Test:      ${{ needs.build-and-test.result }}"
+          echo "CodeQL:            ${{ needs.sast-codeql.result }}"
+          echo "Dependency-Check:  ${{ needs.sca-dependency-check.result }}"
+          echo "SpotBugs:          ${{ needs.static-analysis.result }}"
+          echo "================================================"
+
+          FAILED=0
+
+          if [[ "${{ needs.build-and-test.result }}" != "success" ]]; then
+            echo "::error::Build or tests failed."
+            FAILED=1
+          fi
+
+          if [[ "${{ needs.sast-codeql.result }}" != "success" ]]; then
+            echo "::error::CodeQL execution failed."
+            FAILED=1
+          fi
+
+          if [[ "${{ needs.static-analysis.result }}" != "success" ]]; then
+            echo "::error::SpotBugs execution failed."
+            FAILED=1
+          fi
+
+          if [[ "${{ needs.sca-dependency-check.result }}" != "success" ]]; then
+            echo "::warning::Dependency-Check job did not complete successfully."
+          fi
+
+          if [[ "$FAILED" -eq 1 ]]; then
+            echo "QUALITY GATE FAILED - required CI/security tool execution error."
+            exit 1
+          fi
+
+          echo "Required jobs completed successfully."
+
+      - name: Download Dependency-Check report
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: dependency-check-report
+          path: dependency-check-report
+
+      - name: Analyze Dependency-Check report
+        env:
+          QUALITY_GATE_CVSS: ${{ env.QUALITY_GATE_CVSS }}
+        shell: bash
+        run: |
+          python <<'PY'
+          import json
+          import os
+          import sys
+
+          report = "dependency-check-report/dependency-check-report.json"
+          threshold = float(os.environ.get("QUALITY_GATE_CVSS", "7.0"))
+
+          print("")
+          print("==============================================")
+          print("       DEPENDENCY-CHECK QUALITY GATE")
+          print("==============================================")
+
+          if not os.path.exists(report):
+              print("::warning::Dependency-Check JSON report was not generated.")
+              print("Nightly continues because the report is unavailable.")
+              print("QUALITY GATE COMPLETED WITH WARNING")
+              sys.exit(0)
+
+          with open(report, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          findings = []
+
+          for dependency in data.get("dependencies", []):
+              filename = dependency.get("fileName", "unknown")
+
+              for vulnerability in dependency.get("vulnerabilities") or []:
+                  name = vulnerability.get("name", "UNKNOWN")
+                  severity = str(
+                      vulnerability.get("severity", "UNKNOWN")
+                  ).upper()
+
+                  scores = []
+
+                  for key in ("cvssv4", "cvssv3", "cvssv2"):
+                      cvss = vulnerability.get(key) or {}
+                      try:
+                          if "baseScore" in cvss:
+                              scores.append(float(cvss["baseScore"]))
+                      except (TypeError, ValueError):
+                          pass
+
+                  score = max(scores) if scores else 0.0
+
+                  if severity in ("HIGH", "CRITICAL") or score >= threshold:
+                      findings.append((name, severity, score, filename))
+
+          critical = [x for x in findings if x[1] == "CRITICAL"]
+          high = [x for x in findings if x[1] == "HIGH"]
+
+          print(f"CVSS threshold: {threshold}")
+          print(f"CRITICAL findings: {len(critical)}")
+          print(f"HIGH findings: {len(high)}")
+          print(f"TOTAL findings >= threshold: {len(findings)}")
+          print("==============================================")
+
+          if findings:
+              for name, severity, score, filename in findings[:30]:
+                  print(
+                      f"::warning::{name} | "
+                      f"Severity={severity} | "
+                      f"CVSS={score} | "
+                      f"Dependency={filename}"
+                  )
+
+              if len(findings) > 30:
+                  print(f"... and {len(findings) - 30} additional findings.")
+
+              print("")
+              print("QUALITY GATE: SECURITY FINDINGS DETECTED")
+              print("HIGH/CRITICAL findings were read from the Dependency-Check report.")
+              print("Nightly remains informational; blocking enforcement is applied on main.")
+              sys.exit(0)
+
+          print("")
+          print("QUALITY GATE PASSED")
+          print("No HIGH/CRITICAL dependency vulnerabilities detected.")
+          PY
