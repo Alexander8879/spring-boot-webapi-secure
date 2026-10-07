@@ -43,7 +43,7 @@ jobs:
           distribution: temurin
           cache: maven
 
-      - name: Build & test with coverage
+      - name: Build & test
         run: mvn -B clean verify
 
       - name: Upload test reports
@@ -125,7 +125,66 @@ jobs:
         with:
           category: "/language:java"
 
-  # 4. STATIC ANALYSIS - SPOTBUGS
+  # 4. SCA - OWASP DEPENDENCY-CHECK
+  sca-dependency-check:
+    name: SCA - OWASP Dependency-Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Run OWASP Dependency-Check
+        id: dependency_check
+        continue-on-error: true
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        shell: bash
+        run: |
+          EXTRA_ARGS=()
+
+          if [ -n "$NVD_API_KEY" ]; then
+            echo "NVD API Key configured."
+            EXTRA_ARGS+=("-DnvdApiKey=$NVD_API_KEY")
+          else
+            echo "::warning::NVD API Key not configured."
+          fi
+
+          mvn -B \
+            org.owasp:dependency-check-maven:13.0.0:check \
+            -Dformat=JSON \
+            -DfailBuildOnCVSS=11 \
+            -DossIndexAnalyzerEnabled=false \
+            "${EXTRA_ARGS[@]}"
+
+      - name: Report Dependency-Check status
+        if: always()
+        shell: bash
+        run: |
+          echo "Dependency-Check outcome: ${{ steps.dependency_check.outcome }}"
+
+          if [[ "${{ steps.dependency_check.outcome }}" != "success" ]]; then
+            echo "::warning::Dependency-Check no pudo completar el análisis."
+            echo "::warning::SCA es un control opcional y el pipeline continuará."
+          fi
+
+      - name: Upload Dependency-Check JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: target/dependency-check-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # 5. STATIC ANALYSIS - SPOTBUGS
   static-analysis:
     name: Static Analysis - SpotBugs
     runs-on: ubuntu-latest
@@ -162,7 +221,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # 5. QUALITY GATE
+  # 6. QUALITY GATE
   quality-gate:
     name: Quality Gate
     runs-on: ubuntu-latest
@@ -170,6 +229,7 @@ jobs:
       - build-and-test
       - sast-semgrep
       - sast-codeql
+      - sca-dependency-check
       - static-analysis
     if: always()
 
@@ -183,6 +243,7 @@ jobs:
           echo "Build & Test : ${{ needs.build-and-test.result }}"
           echo "Semgrep      : ${{ needs.sast-semgrep.result }}"
           echo "CodeQL       : ${{ needs.sast-codeql.result }}"
+          echo "SCA          : ${{ needs.sca-dependency-check.result }}"
           echo "SpotBugs     : ${{ needs.static-analysis.result }}"
 
           FAILED=0
@@ -193,18 +254,22 @@ jobs:
           fi
 
           if [[ "${{ needs.sast-semgrep.result }}" != "success" ]]; then
-            echo "::error::Semgrep analysis failed"
+            echo "::error::Semgrep execution failed"
             FAILED=1
           fi
 
           if [[ "${{ needs.sast-codeql.result }}" != "success" ]]; then
-            echo "::error::CodeQL analysis failed"
+            echo "::error::CodeQL execution failed"
             FAILED=1
           fi
 
           if [[ "${{ needs.static-analysis.result }}" != "success" ]]; then
-            echo "::error::SpotBugs analysis failed"
+            echo "::error::SpotBugs execution failed"
             FAILED=1
+          fi
+
+          if [[ "${{ needs.sca-dependency-check.result }}" != "success" ]]; then
+            echo "::warning::Dependency-Check did not complete successfully"
           fi
 
           if [[ "$FAILED" -eq 1 ]]; then
@@ -218,9 +283,9 @@ jobs:
           echo "QUALITY GATE PASSED"
           echo "============================================"
 
-  # 6. DOCKER + TRIVY
+  # 7. DOCKER + TRIVY
   docker-security:
-    name: Docker Build → Trivy Security Gate
+    name: Docker Build → Trivy Security Scan
     runs-on: ubuntu-latest
     needs:
       - quality-gate
@@ -233,7 +298,6 @@ jobs:
 
     permissions:
       contents: read
-      security-events: write
       packages: write
 
     steps:
@@ -261,7 +325,7 @@ jobs:
           exit-code: '0'
           scanners: vuln
 
-      - name: Upload Trivy report
+      - name: Upload Trivy JSON report
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -270,7 +334,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Quality Gate - Read Trivy report
+      - name: Review Trivy findings
+        id: trivy_review
         shell: bash
         run: |
           python <<'PY'
@@ -284,8 +349,12 @@ jobs:
               print("::error::Trivy report was not generated.")
               sys.exit(1)
 
-          with open(report, "r", encoding="utf-8") as f:
-              data = json.load(f)
+          try:
+              with open(report, "r", encoding="utf-8") as f:
+                  data = json.load(f)
+          except Exception as exc:
+              print(f"::error::Unable to read Trivy report: {exc}")
+              sys.exit(1)
 
           findings = []
 
@@ -309,62 +378,64 @@ jobs:
                       })
 
           critical = [
-              x for x in findings
-              if x["severity"] == "CRITICAL"
+              item for item in findings
+              if item["severity"] == "CRITICAL"
           ]
 
           high = [
-              x for x in findings
-              if x["severity"] == "HIGH"
+              item for item in findings
+              if item["severity"] == "HIGH"
           ]
 
           print("")
           print("============================================")
-          print("       TRIVY SECURITY QUALITY GATE")
+          print("          TRIVY SECURITY RESULTS")
           print("============================================")
           print(f"CRITICAL findings : {len(critical)}")
           print(f"HIGH findings     : {len(high)}")
-          print(f"TOTAL blocking    : {len(findings)}")
+          print(f"TOTAL findings    : {len(findings)}")
           print("============================================")
 
+          output_file = os.environ["GITHUB_OUTPUT"]
+
           if findings:
+              with open(output_file, "a", encoding="utf-8") as f:
+                  f.write("has_blocking=true\n")
+
               print("")
-              print("Blocking vulnerabilities:")
+              print("Security findings detected.")
+              print("The report was preserved for DefectDojo analysis.")
+              print("The vulnerable image will not be published to GHCR.")
               print("")
 
-              for item in findings[:30]:
+              for item in findings[:20]:
                   print(
-                      f"{item['id']} | "
+                      f"::warning::{item['id']} | "
                       f"{item['severity']} | "
                       f"{item['package']}"
                   )
 
-              if len(findings) > 30:
+              if len(findings) > 20:
                   print(
-                      f"... and {len(findings) - 30} "
-                      "additional findings"
+                      f"... and {len(findings) - 20} additional findings."
                   )
 
-              print("")
-              print("QUALITY GATE FAILED")
-              print(
-                  "HIGH or CRITICAL vulnerabilities "
-                  "were detected."
-              )
-              sys.exit(1)
+              sys.exit(0)
+
+          with open(output_file, "a", encoding="utf-8") as f:
+              f.write("has_blocking=false\n")
 
           print("")
-          print("QUALITY GATE PASSED")
-          print(
-              "No HIGH or CRITICAL vulnerabilities "
-              "were detected."
-          )
+          print("TRIVY SCAN PASSED")
+          print("No HIGH or CRITICAL vulnerabilities detected.")
           PY
 
       - name: Log in to GitHub Container Registry
         if: |
+          success() &&
           github.event_name == 'push' &&
-          github.ref == 'refs/heads/main'
+          github.ref == 'refs/heads/main' &&
+          steps.trivy_review.outputs.has_blocking == 'false'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -373,8 +444,10 @@ jobs:
 
       - name: Push Docker image to GHCR
         if: |
+          success() &&
           github.event_name == 'push' &&
-          github.ref == 'refs/heads/main'
+          github.ref == 'refs/heads/main' &&
+          steps.trivy_review.outputs.has_blocking == 'false'
         shell: bash
         run: |
           TARGET="${REGISTRY}/${IMAGE_NAME}"
