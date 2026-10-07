@@ -2,9 +2,16 @@ name: Security - Semgrep
 
 on:
   push:
-    branches: [feature/**', 'bugfix/**', 'hotfix/**']
+    branches:
+      - 'feature/**'
+      - 'bugfix/**'
+      - 'hotfix/**'
+
   pull_request:
-    branches: [main, develop]
+    branches:
+      - main
+      - develop
+
   workflow_dispatch:
 
 permissions:
@@ -20,7 +27,7 @@ jobs:
 
     steps:
       - name: Descargar repositorio
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Ejecutar Semgrep
         run: |
@@ -28,17 +35,17 @@ jobs:
             --config auto \
             --config .semgrep.yml \
             --metrics=on \
-            --json-output=semgrep-results.json \
-            --sarif-output=semgrep-results.sarif \
+            --json-output=semgrep-report.json \
+            --sarif-output=semgrep-report.sarif \
             src/main/java
 
       - name: Publicar reportes de Semgrep
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: semgrep-reports
+          name: semgrep-report
           path: |
-            semgrep-results.json
-            semgrep-results.sarif
+            semgrep-report.json
+            semgrep-report.sarif
           if-no-files-found: warn
           retention-days: 14

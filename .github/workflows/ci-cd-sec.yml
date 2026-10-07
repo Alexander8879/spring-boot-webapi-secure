@@ -5,12 +5,11 @@ on:
     branches:
       - main
       - develop
-
+      - proyecto-final-devsecops
   pull_request:
     branches:
       - main
       - develop
-
   workflow_dispatch:
 
 concurrency:
@@ -26,10 +25,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-
-  # ================================================================
   # 1. BUILD + TEST
-  # ================================================================
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
@@ -61,10 +57,38 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # 2. SAST - SEMGREP
+  sast-semgrep:
+    name: SAST - Semgrep
+    runs-on: ubuntu-latest
 
-  # ================================================================
-  # 2. SAST - CODEQL
-  # ================================================================
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Semgrep
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            semgrep/semgrep \
+            semgrep scan \
+              --config p/java \
+              --json \
+              --output /src/semgrep-report.json \
+              /src/src/main/java
+
+      - name: Upload Semgrep JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # 3. SAST - CODEQL
   sast-codeql:
     name: SAST - CodeQL
     runs-on: ubuntu-latest
@@ -101,10 +125,7 @@ jobs:
         with:
           category: "/language:java"
 
-
-  # ================================================================
-  # 3. STATIC ANALYSIS - SPOTBUGS
-  # ================================================================
+  # 4. STATIC ANALYSIS - SPOTBUGS
   static-analysis:
     name: Static Analysis - SpotBugs
     runs-on: ubuntu-latest
@@ -141,19 +162,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-
-  # ================================================================
-  # 4. QUALITY GATE DEL CI
-  # ================================================================
+  # 5. QUALITY GATE
   quality-gate:
     name: Quality Gate
     runs-on: ubuntu-latest
-
     needs:
       - build-and-test
+      - sast-semgrep
       - sast-codeql
       - static-analysis
-
     if: always()
 
     steps:
@@ -163,8 +180,8 @@ jobs:
           echo "============================================"
           echo "          DEVSECOPS QUALITY GATE"
           echo "============================================"
-
           echo "Build & Test : ${{ needs.build-and-test.result }}"
+          echo "Semgrep      : ${{ needs.sast-semgrep.result }}"
           echo "CodeQL       : ${{ needs.sast-codeql.result }}"
           echo "SpotBugs     : ${{ needs.static-analysis.result }}"
 
@@ -172,6 +189,11 @@ jobs:
 
           if [[ "${{ needs.build-and-test.result }}" != "success" ]]; then
             echo "::error::Build or tests failed"
+            FAILED=1
+          fi
+
+          if [[ "${{ needs.sast-semgrep.result }}" != "success" ]]; then
+            echo "::error::Semgrep analysis failed"
             FAILED=1
           fi
 
@@ -196,28 +218,18 @@ jobs:
           echo "QUALITY GATE PASSED"
           echo "============================================"
 
-
-  # ================================================================
-  # 5. DOCKER + TRIVY SECURITY GATE
-  #
-  # NO corre en develop.
-  #
-  # Corre:
-  # - Pull Request hacia main
-  # - Push real a main
-  #
-  # Esto permite bloquear merges peligrosos hacia main.
-  # ================================================================
+  # 6. DOCKER + TRIVY
   docker-security:
     name: Docker Build → Trivy Security Gate
     runs-on: ubuntu-latest
-
     needs:
       - quality-gate
 
     if: |
+      github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' && github.base_ref == 'main') ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/proyecto-final-devsecops')
 
     permissions:
       contents: read
@@ -231,10 +243,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-
-      # ------------------------------------------------------------
-      # Construir imagen solamente para analizarla
-      # ------------------------------------------------------------
       - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
@@ -243,57 +251,34 @@ jobs:
           load: true
           tags: devsecops-local:${{ github.sha }}
 
-
-      # ------------------------------------------------------------
-      # TRIVY - generar reporte JSON
-      #
-      # IMPORTANTE:
-      # Trivy NO tumba directamente el workflow.
-      # Primero genera el reporte.
-      # Después nuestro Quality Gate LO LEE.
-      # ------------------------------------------------------------
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: devsecops-local:${{ github.sha }}
           format: json
-          output: trivy-results.json
+          output: trivy-report.json
           severity: CRITICAL,HIGH
           exit-code: '0'
           scanners: vuln
 
-
-      # ------------------------------------------------------------
-      # Guardar reporte
-      # ------------------------------------------------------------
       - name: Upload Trivy report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trivy-security-report
-          path: trivy-results.json
+          name: trivy-report
+          path: trivy-report.json
           if-no-files-found: error
           retention-days: 14
 
-
-      # ------------------------------------------------------------
-      # QUALITY GATE DE SEGURIDAD
-      #
-      # Lee realmente el JSON generado por Trivy.
-      # Si encuentra HIGH/CRITICAL:
-      #    exit 1
-      #
-      # De esta forma los merges hacia main pueden bloquearse.
-      # ------------------------------------------------------------
       - name: Quality Gate - Read Trivy report
         shell: bash
         run: |
           python <<'PY'
           import json
-          import sys
           import os
+          import sys
 
-          report = "trivy-results.json"
+          report = "trivy-report.json"
 
           if not os.path.exists(report):
               print("::error::Trivy report was not generated.")
@@ -306,7 +291,6 @@ jobs:
 
           for result in data.get("Results", []):
               for vulnerability in result.get("Vulnerabilities") or []:
-
                   severity = str(
                       vulnerability.get("Severity", "")
                   ).upper()
@@ -344,7 +328,6 @@ jobs:
           print("============================================")
 
           if findings:
-
               print("")
               print("Blocking vulnerabilities:")
               print("")
@@ -368,7 +351,6 @@ jobs:
                   "HIGH or CRITICAL vulnerabilities "
                   "were detected."
               )
-
               sys.exit(1)
 
           print("")
@@ -379,11 +361,6 @@ jobs:
           )
           PY
 
-
-      # ------------------------------------------------------------
-      # Login GHCR
-      # SOLO después de pasar Trivy y SOLO en push a main
-      # ------------------------------------------------------------
       - name: Log in to GitHub Container Registry
         if: |
           github.event_name == 'push' &&
@@ -394,10 +371,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-
-      # ------------------------------------------------------------
-      # Publicar imagen únicamente en MAIN
-      # ------------------------------------------------------------
       - name: Push Docker image to GHCR
         if: |
           github.event_name == 'push' &&

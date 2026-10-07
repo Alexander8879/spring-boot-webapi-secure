@@ -3,3 +3,18 @@ target/
 *.iml
 .vscode/
 *.log
+
+# Variables y archivos sensibles
+.env
+.env.*
+maven-settings.xml
+
+# Datos y reportes locales generados
+odc-data/
+odc-reports/
+reports/
+
+# Reportes locales de seguridad
+semgrep-results.json
+semgrep-report.json
+trivy-report.json

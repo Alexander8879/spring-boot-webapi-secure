@@ -70,11 +70,14 @@
 
     <build>
         <plugins>
+
+            <!-- Spring Boot -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
 
+            <!-- JaCoCo -->
             <plugin>
                 <groupId>org.jacoco</groupId>
                 <artifactId>jacoco-maven-plugin</artifactId>
@@ -102,7 +105,12 @@
                 <version>11.1.1</version>
                 <configuration>
                     <failBuildOnCVSS>7</failBuildOnCVSS>
-                    <nvdApiKey>CONSERVA_AQUI_TU_CLAVE_ACTUAL</nvdApiKey>
+
+                    <!--
+                    La clave NVD se obtiene desde una variable de entorno
+                    o GitHub Secret. Nunca se guarda directamente en el POM.
+                    -->
+                    <nvdApiKey>${env.NVD_API_KEY}</nvdApiKey>
                 </configuration>
             </plugin>
 
@@ -130,6 +138,7 @@
                     <includeTestScope>false</includeTestScope>
                 </configuration>
             </plugin>
+
         </plugins>
     </build>
 </project>
